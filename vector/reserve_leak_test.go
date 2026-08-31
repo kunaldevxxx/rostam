@@ -181,13 +181,32 @@ func TestCloseReleasesEveryReservation(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		cfg  func(*testing.T) Config
+		// needsFileReservations marks the case whose slabs are mmap-backed, and
+		// so only reservation-backed where a file-backed slab can be (Linux).
+		// Elsewhere those slabs never take a reservation, leaving nothing for
+		// this test's balance to say anything about.
+		needsFileReservations bool
 	}{
-		{"heap", func(*testing.T) Config {
+		{name: "heap", cfg: func(*testing.T) Config {
 			return Config{Dim: dim, Metric: L2, M: 8, EfConstruction: 32, EfSearch: 16, Seed: 5}
 		}},
-		{"mmap+codes", mmapGrowConfig(dim, 5)},
+		// The codes slab is ALWAYS anonymous, so it takes a reservation
+		// wherever anonymous ones exist - including where file-backed ones do
+		// not. Without this case the mmap one below is the only quantized one,
+		// and skipping it would leave Close's release of the codes reservation
+		// unverified on exactly the platform this branch adds.
+		{name: "heap+codes", cfg: func(*testing.T) Config {
+			return Config{
+				Dim: dim, Metric: L2, M: 8, EfConstruction: 32, EfSearch: 16, Seed: 5,
+				Quant: QuantSQ8,
+			}
+		}},
+		{name: "mmap+codes", cfg: mmapGrowConfig(dim, 5), needsFileReservations: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.needsFileReservations {
+				requireFileBackedReservations(t)
+			}
 			delta := reservationBalance(t, func() {
 				h, err := newHNSW(tc.cfg(t))
 				if err != nil {

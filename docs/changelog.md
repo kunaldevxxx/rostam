@@ -13,6 +13,18 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
   plane alongside the existing binary protocol: `GET`, `PUT`, and `DELETE
   /v1/kv/{key}`.
 
+- **Slabs grow in place on Windows too (heap-backed).** The address-space
+  reservation that removed the multi-hundred-millisecond reader stall at a slab
+  growth boundary now exists on 64-bit Windows, built on `VirtualAlloc`'s native
+  reserve/commit split. It covers the heap-backed slabs — `arena.vecs` and the
+  level-0 graph in heap mode, and the quantization codes always — which is where
+  the larger stall was measured (1.502 s to 10.2 ms on Linux, against 188.9 ms to
+  17.1 ms for the mmap-backed ones). An **mmap-backed** slab on Windows still
+  grows the old copy/remap way: committing a file view into the middle of an
+  existing reservation needs the Windows 10 1803 placeholder API, which is not
+  wired up. Nothing changes for Linux, and a reservation remains an optimization
+  — where it cannot be made, growth simply falls back.
+
 ## v0.5.0 — 2026-08-30
 
 - **Eight new key-value ops: `exists`, `getdel`, `getset`, `persist`, `ttl`,

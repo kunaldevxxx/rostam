@@ -49,6 +49,18 @@ func withSmallReservations(t *testing.T, threshold, minReserve, factor int64) {
 	})
 }
 
+// requireFileBackedReservations skips a test whose subject is an MMAP-BACKED
+// slab growing in place. Where only anonymous reservations exist (Windows), an
+// mmap-backed slab falls back to copy/remap, so a stable base — and everything
+// downstream of it — is not a property the platform has. The heap variants of
+// these same tests still run there and cover the reservation machinery itself.
+func requireFileBackedReservations(t *testing.T) {
+	t.Helper()
+	if !fileBackedSlabReservationsSupported {
+		t.Skip("file-backed slabs use the copy/remap growth path on this platform")
+	}
+}
+
 func vecsBase(h *hnsw) unsafe.Pointer {
 	if len(h.arena.vecs) == 0 {
 		return nil
@@ -191,6 +203,7 @@ func TestGrowInPlaceStableBaseHeap(t *testing.T) {
 // not merely slow but a SIGBUS risk for any reader still walking the old range.
 func TestGrowInPlaceStableBaseMmap(t *testing.T) {
 	withSmallReservations(t, 64<<10, 64<<10, 64)
+	requireFileBackedReservations(t)
 	dir := t.TempDir()
 	cfg := Config{
 		Dim: 32, Metric: L2, M: 8, EfConstruction: 32, EfSearch: 16, Seed: 5,
@@ -231,7 +244,12 @@ func TestGrowInPlaceEquivalentHeap(t *testing.T) {
 	})
 }
 
+// TestGrowInPlaceEquivalentMmap is the file-backed half of that differential.
+// It needs a platform where an mmap-backed slab can itself be
+// reservation-backed, which is not every platform that maps files at all —
+// see requireFileBackedReservations.
 func TestGrowInPlaceEquivalentMmap(t *testing.T) {
+	requireFileBackedReservations(t)
 	testGrowEquivalent(t, 5000, 64, mmapGrowConfig(24, 9))
 }
 
@@ -246,7 +264,11 @@ func TestGrowRelocationEquivalentHeap(t *testing.T) {
 	})
 }
 
+// TestGrowRelocationEquivalentMmap drives the relocation path on file-backed
+// slabs, where the copy is between two MAPPINGS rather than two heap
+// allocations. Skipped where those slabs never take a reservation.
 func TestGrowRelocationEquivalentMmap(t *testing.T) {
+	requireFileBackedReservations(t)
 	testGrowEquivalent(t, 5000, 1, mmapGrowConfig(24, 4))
 }
 
@@ -363,7 +385,11 @@ func TestGrowInPlaceConcurrentHeap(t *testing.T) {
 	}
 }
 
+// TestGrowInPlaceConcurrentMmap is the same race coverage for file-backed
+// slabs, whose commit maps a new tail over the reservation instead of
+// re-protecting anonymous pages. Skipped where that is unavailable.
 func TestGrowInPlaceConcurrentMmap(t *testing.T) {
+	requireFileBackedReservations(t)
 	withSmallReservations(t, 64<<10, 64<<10, 64)
 	dir := t.TempDir()
 	cfg := Config{

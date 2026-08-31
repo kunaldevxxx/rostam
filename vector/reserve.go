@@ -92,12 +92,21 @@ import (
 // heap-backed configuration too.
 //
 // FALLBACK, EVERYWHERE. A reservation is an optimization, never a requirement.
-// Only 64-bit Linux has newSlabReservation — Windows maps files too but keeps
-// the copy/remap growth path (see mmap_windows.go), and the platforms in
-// mmap_other.go have no mmap storage at all — a reservation that cannot be made
-// is simply
-// not made, and a reservation that runs out of reserved range relocates once to
-// a bigger one — paying the old copy/remap exactly there. Every one of those
+// Where one cannot be made it simply is not made, and a reservation that runs
+// out of reserved range relocates once to a bigger one — paying the old
+// copy/remap exactly there.
+//
+// Which is available is now two questions rather than one, because Windows
+// answers them differently. slabReservationsSupported says whether ANONYMOUS
+// slabs can be reserved: true on 64-bit Linux and 64-bit Windows, where
+// VirtualAlloc splits reserve from commit natively. fileBackedSlabReservations-
+// Supported says whether an MMAP-BACKED slab can be, and that is 64-bit Linux
+// alone: committing one means mapping the new tail over its slice of the
+// reservation, which Linux does with MAP_FIXED and Windows has no equivalent
+// for outside the placeholder API (see reserve_windows.go). So an mmap-backed
+// slab on Windows keeps the copy/remap growth path while its anonymous
+// neighbours — arena.vecs and level-0 in heap mode, and the codes slab always —
+// grow in place. The platforms in mmap_other.go have neither. Every one of those
 // paths lands back on the pre-existing grow code, so behavior is identical and
 // only latency differs.
 

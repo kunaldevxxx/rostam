@@ -56,6 +56,14 @@ type slabReservation struct {
 // reservations skip rather than fail on a platform that has none.
 const slabReservationsSupported = true
 
+// fileBackedSlabReservationsSupported reports whether an mmap-backed slab can
+// live on a reservation too, not just an anonymous one. Linux commits a
+// file-backed slab by mapping the new tail over its slice of the reservation
+// with MAP_FIXED, so both backings get the in-place growth; Windows has no
+// equivalent that is safe to use (see reserve_windows.go), which is why the two
+// capabilities are separate constants rather than one.
+const fileBackedSlabReservationsSupported = true
+
 // mapped reports whether the reservation still holds its range. Portable
 // counterpart of the base pointer, so tests can assert "this was released"
 // without reaching into a platform-specific field.
