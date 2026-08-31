@@ -79,6 +79,7 @@ func (c *Cache) Flush() error {
 //     the next COLD COMPACTION — which runs for an mmap shard at open (a restart), and
 //     NEVER online for a heap shard (heap has no cold-compaction path), so a full heap
 //     reject-writes shard does not regain capacity until the process restarts.
+//
 // Online reclaim under reject-writes is a separate, deeper change (it would have to
 // rendezvous with any lock-free reader still aliasing the pages) and is intentionally
 // NOT done here.
