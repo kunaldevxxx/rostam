@@ -188,11 +188,21 @@ func (r *slabReservation) release() error {
 	if r == nil || r.base == nil {
 		return nil
 	}
-	base, n := r.base, r.resLen
-	r.base, r.commit, r.resLen = nil, 0, 0
-	liveSlabReservations.Add(-1)
-	if err := unix.MunmapPtr(base, n); err != nil {
+	// The bookkeeping is cleared only AFTER the unmap succeeds. Doing it
+	// first would say "released" about a range that is still mapped:
+	// mapped() would report false, liveSlabReservations would under-count
+	// the very leak it exists to detect - so reserve_leak_test.go would
+	// pass while the range leaked - and a second release would return
+	// early instead of trying again.
+	//
+	// munmap of a range this package mapped itself is close to
+	// unfailable, which is why the order went unnoticed; that makes it
+	// cheap to get right rather than a reason to leave it.
+	if err := unix.MunmapPtr(r.base, r.resLen); err != nil {
 		return fmt.Errorf("vector: munmap reservation: %w", err)
 	}
+
+	r.base, r.commit, r.resLen = nil, 0, 0
+	liveSlabReservations.Add(-1)
 	return nil
 }
