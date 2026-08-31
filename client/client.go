@@ -526,9 +526,17 @@ func (e *ambiguousError) Unwrap() error { return e.err }
 // original, and persist/caex report the wrong bit or extend a lease the caller
 // can no longer be sure it still holds. Read-only / idempotent ops (get, exists,
 // ttl, mget) are deliberately absent: replaying them cannot corrupt a result.
+//
+// "flush" and its INTERNAL per-group wrapper "__flush_shard__" (cluster's
+// opFlushShardName, forwarded between nodes over a peer Client) are both here: a
+// flush is idempotent ONLY while nothing writes between attempts, so replaying one
+// whose commit succeeded but whose response was lost would silently re-wipe writes
+// made in the interval. The wrapper must carry the same guard as "flush" or the
+// double-apply hole reopens one layer down — cluster.proposeFlush relies on this to
+// surface an ambiguous per-group flush instead of the peer Client re-sending it.
 func nonReplayableOp(op string) bool {
 	switch op {
-	case "set_nx", "cas", "cad", "getdel", "getset", "incr_ex", "caex", "persist", "flush":
+	case "set_nx", "cas", "cad", "getdel", "getset", "incr_ex", "caex", "persist", "flush", "__flush_shard__":
 		return true
 	}
 	return false
@@ -541,6 +549,15 @@ func isAmbiguous(err error) bool {
 	var a *ambiguousError
 	return errors.As(err, &a)
 }
+
+// IsAmbiguous reports whether err (returned by Client.Call) is a post-transmission
+// transport failure: the request may have committed on the server before the failure,
+// so its outcome is UNKNOWN. Exposed for callers that forward a non-replayable op
+// across peers and must not try another target after an ambiguous send — notably
+// cluster.proposeFlush, whose per-group flush leg must surface such an error rather
+// than re-issue the wipe against the next owner. A PRE-transmission failure (dial
+// refused, no leader yet) is not ambiguous and is safe to retry elsewhere.
+func IsAmbiguous(err error) bool { return isAmbiguous(err) }
 
 // isTransportError reports whether err is a network-level transport
 // error (dial refused, connection reset, EOF, etc.) that is safe to

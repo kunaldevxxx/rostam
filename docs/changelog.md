@@ -16,7 +16,11 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
   `Flush(ctx)` and over REST as `POST /v1/kv/flush`. This removes the need for
   the generation-counter workaround a cache driver otherwise needs for
   `Cache::flush()`-style clears (which is not correct on the client side, because
-  the counter is itself an evictable cache entry).
+  the counter is itself an evictable cache entry). Caveat: flush empties the
+  keyspace but leaves the page allocation intact, so under the non-default
+  `PolicyRejectWrites` a shard that was full can still reject the next write with
+  "at capacity" until its space is reclaimed by a later cold compaction (at
+  restart) — under the default ring-buffer eviction policy this is invisible.
 
 - **Embedded web dashboard.** The server now ships a browser UI at
   `/dashboard/` for inspecting and operating on a running instance — vector

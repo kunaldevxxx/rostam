@@ -110,6 +110,12 @@ func TestClassifyApplyErr(t *testing.T) {
 		// divergence as ErrOpNotRegistered.
 		{"ops.ErrWASMNoGroupBinding", ops.ErrWASMNoGroupBinding},
 		{"wrapped ops.ErrWASMNoGroupBinding (as the resolver wraps it)", fmt.Errorf("%w: op %q shard group %d", ops.ErrWASMNoGroupBinding, "udf", 3)},
+		// A flush whose durability watermark (sidecar) could not be persisted on THIS
+		// node. A local disk fault a peer need not share, so advancing over it would
+		// resurrect pre-flush keys on a later failover — fatal, like ErrFull. The
+		// wrapped case mirrors how cache.shard.flush wraps the sidecar I/O cause.
+		{"cache.ErrFlushNotDurable", cache.ErrFlushNotDurable},
+		{"wrapped cache.ErrFlushNotDurable (as cache.flush wraps the I/O cause)", fmt.Errorf("%w: %w", cache.ErrFlushNotDurable, errors.New("fsync flush sidecar dir: read-only file system"))},
 	}
 	for _, tc := range fatal {
 		if got := classifyApplyErr(tc.err); got != classFatal {

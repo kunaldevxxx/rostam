@@ -4,6 +4,7 @@
 package cache
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -292,9 +293,12 @@ func TestFlushHeapNeedsNoSidecar(t *testing.T) {
 	}
 }
 
-// TestFlushSidecarCorruptionTolerance: a corrupt sidecar falls back to floor 0 —
-// pre-flush data may resurrect, but the open must NOT crash or fail.
-func TestFlushSidecarCorruptionTolerance(t *testing.T) {
+// TestFlushSidecarCorruptionFailsOpen: a PRESENT-but-corrupt sidecar must FAIL the
+// reopen, not silently fall back to floor 0. Falling back to 0 would re-index every
+// pre-flush entry permanently (the applied index is already past the flush op, so a
+// warm restart never replays it) and diverge this replica from peers whose sidecar is
+// intact — so a corrupt watermark is surfaced to the operator instead.
+func TestFlushSidecarCorruptionFailsOpen(t *testing.T) {
 	dir := t.TempDir()
 	cfg := flushCfg(dir, 1)
 
@@ -325,16 +329,42 @@ func TestFlushSidecarCorruptionTolerance(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Must open cleanly (fail-open to floor 0), not panic or error.
+	// Reopen MUST fail: a present-but-invalid watermark is a durability fault, not a
+	// "never flushed" signal.
+	c2, err := New(cfg)
+	if err == nil {
+		_ = c2.Close()
+		t.Fatalf("reopen with a corrupt sidecar must FAIL, but succeeded")
+	}
+}
+
+// TestFlushSidecarAbsentOpensNormally: a genuinely ABSENT sidecar (never flushed, or
+// a shard predating the feature) opens normally at floor 0 — the backward-compatible
+// path that must survive the fail-closed change above.
+func TestFlushSidecarAbsentOpensNormally(t *testing.T) {
+	dir := t.TempDir()
+	cfg := flushCfg(dir, 1)
+
+	c, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Put([]byte("k"), []byte("v"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// No flush ever happened, so no sidecar exists. Reopen must succeed and the key
+	// must survive (floor 0 wipes nothing).
 	c2, err := New(cfg)
 	if err != nil {
-		t.Fatalf("reopen with corrupt sidecar must not fail: %v", err)
+		t.Fatalf("reopen with no sidecar must succeed: %v", err)
 	}
 	defer c2.Close()
-	// floor 0 ⇒ the pre-flush key is re-indexed (resurrection is the documented,
-	// accepted cost of a corrupt watermark). We only require no crash.
-	if _, err := c2.Get([]byte("k")); err != nil && err != ErrNotFound {
-		t.Fatalf("unexpected Get error after corrupt-sidecar reopen: %v", err)
+	if v, err := c2.Get([]byte("k")); err != nil || string(v) != "v" {
+		t.Fatalf("key after no-sidecar reopen = %q err=%v, want v", v, err)
 	}
 }
 
@@ -369,5 +399,46 @@ func TestFlushIdempotent(t *testing.T) {
 				t.Fatalf("after double flush live count = %d, want 0", got)
 			}
 		})
+	}
+}
+
+// TestFlushSidecarWriteFailureIsNotDurable proves a sidecar I/O failure surfaces as
+// cache.ErrFlushNotDurable — the sentinel shard/apply_class.go classifies classFatal,
+// so a replicated follower that could not durably record the watermark HALTS rather
+// than advancing past a flush it did not durably apply. The failure is injected by
+// pre-creating the sidecar's temp path AS A DIRECTORY, so writeFlushSidecar's
+// O_CREATE|O_WRONLY open fails with EISDIR — a real I/O error that does not depend on
+// running as an unprivileged user.
+func TestFlushSidecarWriteFailureIsNotDurable(t *testing.T) {
+	dir := t.TempDir()
+	cfg := flushCfg(dir, 1)
+
+	c, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if err := c.Put([]byte("k"), []byte("v"), 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Block the atomic sidecar write: its staging temp path already exists as a
+	// directory, so the O_CREATE|O_WRONLY|O_TRUNC open cannot succeed.
+	tmp := filepath.Join(dir, "shard-0000", flushSidecarName+flushSidecarTmpSuffix)
+	if err := os.Mkdir(tmp, 0o750); err != nil {
+		t.Fatalf("stage temp-as-directory: %v", err)
+	}
+
+	err = c.Flush()
+	if err == nil {
+		t.Fatalf("Flush must fail when the sidecar cannot be written")
+	}
+	if !errors.Is(err, ErrFlushNotDurable) {
+		t.Fatalf("Flush error = %v, want errors.Is(..., ErrFlushNotDurable)", err)
+	}
+	// The keyspace stays intact: the sidecar is written BEFORE the index swap, so a
+	// sidecar failure aborts with nothing wiped.
+	if v, gerr := c.Get([]byte("k")); gerr != nil || string(v) != "v" {
+		t.Fatalf("key after failed flush = %q err=%v, want v (keyspace must stay intact)", v, gerr)
 	}
 }

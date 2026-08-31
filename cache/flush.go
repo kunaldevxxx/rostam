@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
-	"log/slog"
 	"os"
 	"path/filepath"
 )
@@ -69,6 +68,20 @@ func (c *Cache) Flush() error {
 //     same recovery path an mmap shard already relies on. So a running shard's
 //     BytesUsed stays non-zero after flush; its LIVE keyset is nonetheless empty
 //     (every Get misses, Iterate yields nothing).
+//
+// KNOWN LIMITATION — flush frees the KEYSPACE but not necessarily WRITE CAPACITY.
+// Because the page head/tail offsets above are deliberately left intact (the lock-
+// free reject-writes reader contract), a shard that was FULL stays full after flush:
+//   - Under PolicyRingbufEvict (the DEFAULT) this is invisible — the ring evicts to
+//     make room, so the next write reclaims the flushed space and succeeds.
+//   - Under PolicyRejectWrites it is visible: the next write can still return ErrFull
+//     even though the keyspace is now logically EMPTY. The space is reclaimed only by
+//     the next COLD COMPACTION — which runs for an mmap shard at open (a restart), and
+//     NEVER online for a heap shard (heap has no cold-compaction path), so a full heap
+//     reject-writes shard does not regain capacity until the process restarts.
+// Online reclaim under reject-writes is a separate, deeper change (it would have to
+// rendezvous with any lock-free reader still aliasing the pages) and is intentionally
+// NOT done here.
 func (s *shard) flush() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -100,7 +113,15 @@ func (s *shard) flush() error {
 	// nothing to persist — skip the sidecar entirely.
 	if s.isMmap {
 		if err := s.writeFlushSidecar(floor); err != nil {
-			return err
+			// Wrap so the REPLICATED apply path can errors.Is this as ErrFlushNotDurable
+			// and classify it classFatal (shard/apply_class.go): a follower that could
+			// not durably record the watermark must HALT rather than advance its applied
+			// index past a flush it did not durably apply — advancing would resurrect
+			// pre-flush keys on a later failover and diverge it from peers whose sidecar
+			// landed. The multi-%w keeps both the sentinel and the underlying I/O cause
+			// visible through errors.Is. On the leader this still returns BEFORE the swap
+			// below, so the keyspace stays intact either way.
+			return fmt.Errorf("%w: %w", ErrFlushNotDurable, err)
 		}
 	}
 
@@ -219,26 +240,35 @@ func (s *shard) writeFlushSidecar(floor uint64) error {
 }
 
 // readFlushSidecar restores the flush watermark for a shard opening from dataDir.
-// A MISSING sidecar returns 0 — today's behaviour exactly, "nothing was ever
-// flushed". A present-but-invalid sidecar (torn write, CRC mismatch, foreign file)
-// ALSO returns 0 but is logged: the shard fails OPEN (pre-flush data may resurrect)
-// rather than refusing to start, mirroring readAppliedStamp/readPBFrontier, whose
-// 0-on-corruption is likewise the safe under-report.
-func readFlushSidecar(dataDir string) uint64 {
+// A genuinely ABSENT sidecar returns (0, nil) — today's behaviour exactly, "nothing
+// was ever flushed", and backward-compatible with a shard that predates the feature.
+//
+// A PRESENT-but-invalid sidecar (a read error other than not-exist, a torn write, a
+// CRC mismatch, or a foreign file) returns (0, error) and FAILS the shard open. This
+// deliberately does NOT mirror readAppliedStamp/readPBFrontier's 0-on-corruption:
+// their 0 triggers a REBUILD/recovery that reconverges, whereas a flush watermark of
+// 0 re-indexes every pre-flush entry PERMANENTLY. The applied index is already past
+// the flush op, so a warm restart never replays it (shard/fsm.go skips already-
+// applied indices), and this replica would silently diverge from peers whose sidecar
+// is intact. A corrupt watermark is a durability fault the operator must see, not a
+// silent resurrection — so we refuse to open rather than fabricate floor 0.
+func readFlushSidecar(dataDir string) (uint64, error) {
 	path := filepath.Join(dataDir, flushSidecarName)
 	b, err := os.ReadFile(path) //nolint:gosec // dataDir is caller-configured
 	if err != nil {
-		if !os.IsNotExist(err) {
-			slog.Warn("cache: cannot read flush sidecar; treating as no flush",
-				"component", "cache", "path", path, "err", err)
+		if os.IsNotExist(err) {
+			// Never flushed (or a pre-feature shard) — the sole backward-compatible
+			// "open normally at floor 0" path.
+			return 0, nil
 		}
-		return 0
+		// A present sidecar we cannot READ (permissions, I/O error) is as ambiguous as
+		// a corrupt one: we cannot prove nothing was flushed, so fail rather than
+		// under-report the watermark.
+		return 0, fmt.Errorf("cache: read flush sidecar %s: %w", path, err)
 	}
 	floor, ok := decodeFlushSidecar(b)
 	if !ok {
-		slog.Warn("cache: flush sidecar failed validation; treating as no flush (pre-flush data may resurrect)",
-			"component", "cache", "path", path)
-		return 0
+		return 0, fmt.Errorf("cache: flush sidecar %s failed validation (corrupt watermark; refusing to open lest pre-flush data resurrect and diverge this replica)", path)
 	}
-	return floor
+	return floor, nil
 }

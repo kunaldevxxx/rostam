@@ -33,6 +33,20 @@ var ErrFull = errors.New("cache: shard at capacity")
 // from the inline error it replaced.
 var ErrCannotEvict = errors.New("cache: nothing left to evict and still no room")
 
+// ErrFlushNotDurable marks a Cache.Flush() that could not make its per-shard
+// durability watermark (the flushed.seq sidecar) durable — a create/write/fsync/
+// rename/dir-fsync failure in writeFlushSidecar. It is NON-DETERMINISTIC across
+// replicas: a local disk fault on one node need not occur on its peers. On the
+// LEADER the sidecar is written BEFORE the index swap, so a failure returns with the
+// keyspace intact; but a replicated apply must additionally guarantee that a FOLLOWER
+// which hit this error does NOT advance its applied index past the flush, because
+// advancing over a flush it could not durably apply would resurrect every pre-flush
+// key on a later failover — silent divergence from peers whose sidecar landed. So
+// shard/apply_class.go classifies it classFatal (fail-closed), exactly like ErrFull
+// and ErrCannotEvict. Cache.Flush wraps every sidecar I/O failure so callers can
+// errors.Is it through the apply path's multi-%w wrapping.
+var ErrFlushNotDurable = errors.New("cache: flush watermark not durable")
+
 // shard is one independent slice of the cache: its own page list, lock,
 // and index. Shards do not share state and are safe to use concurrently
 // across goroutines.
@@ -297,7 +311,18 @@ func newShard(cfg Config, dataDir string) (*shard, error) {
 	// sidecar that outlived a rotated-aside pages file would otherwise let post-fresh
 	// low-seq writes be wrongly skipped on the next restart — the writeSeq floor-lift
 	// below closes that too.
-	s.flushedThroughSeq = readFlushSidecar(dataDir)
+	// A present-but-invalid sidecar FAILS the open (see readFlushSidecar): a corrupt
+	// flush watermark cannot be silently downgraded to floor 0, which would re-index
+	// pre-flush entries permanently and diverge this replica from peers with intact
+	// sidecars. A genuinely absent sidecar returns (0, nil) and opens normally.
+	flushedFloor, ferr := readFlushSidecar(dataDir)
+	if ferr != nil {
+		if s.file != nil {
+			_ = munmapAndClose(s.file, s.region)
+		}
+		return nil, ferr
+	}
+	s.flushedThroughSeq = flushedFloor
 	if !fresh {
 		// Restore the persisted LOGICAL clock (v3 header; 0 on a v2 file). This is
 		// what lets cold compaction judge TTL expiry deterministically on a

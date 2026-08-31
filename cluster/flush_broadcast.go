@@ -88,6 +88,17 @@ const flushBroadcastGroupTimeout = 10 * time.Second
 // client op is nonReplayableOp, so Client.Call never blindly replays an ambiguous
 // flush; a caller re-issues only when re-wiping intervening writes is acceptable.
 //
+// THE INTERNAL LEG IS ITSELF AMBIGUOUS-SAFE — no post-send owner retry. proposeFlush
+// forwards __flush_shard__ via forwardTimeoutNoReplay, which surfaces an ambiguous
+// (post-transmission) per-owner failure instead of re-sending the wrapper to the next
+// owner, and __flush_shard__ is a nonReplayableOp so the peer Client does not auto-
+// retry it after an ambiguous send either. Both together mean a group whose flush
+// COMMITTED but whose response was lost is reported as a partial failure and bubbles
+// up as the broadcast error — never a silent SECOND flush of that group. That closes
+// the "flush is not blindly replayable under concurrency" contract end to end: the
+// external op guard (nonReplayableOp "flush") stops the client re-issuing, and this
+// stops the internal fan-out re-issuing one layer down.
+//
 // PARTIAL FAILURE. Every group is attempted even after one fails (a transient
 // election on group 3 must not deny groups 4..N the flush); a non-empty failure set
 // leaves the keyspace PARTIALLY wiped and is returned as an error so the caller can
@@ -114,9 +125,14 @@ func (n *Node) broadcastFlush() ([]byte, error) {
 //     multi-shard cluster): shard.Store.Call answers NotLeaderError, so hop;
 //   - not hosted at all (partitioned cluster): hop.
 //
-// The hop reuses forwardTimeout, whose per-owner client follows NotLeader to the
-// group's leader — but carries the shard-scoped wrapper op so the peer handles this
-// ONE group and does not re-broadcast (see opFlushShardName).
+// The hop reuses forwardTimeoutNoReplay, whose per-owner client follows NotLeader to
+// the group's leader — but carries the shard-scoped wrapper op so the peer handles
+// this ONE group and does not re-broadcast (see opFlushShardName). NoReplay because a
+// flush is not blindly replayable: on an AMBIGUOUS (post-transmission) per-owner
+// error the wrapper's commit may already have landed, so we must NOT re-send it to
+// the next owner (that would double-apply and re-wipe intervening writes). An
+// ambiguous error therefore propagates up as a partial failure; a PRE-transmission
+// error (dial/NotLeader/no-leader-yet) is safe and still rotates to the next owner.
 //
 // A NotLeaderError must not escape to the client here: a broadcast spans groups with
 // DIFFERENT leaders, so "retry at node X" is not a hint any single node can satisfy,
@@ -137,7 +153,7 @@ func (n *Node) proposeFlush(idx int) error {
 		}
 		hostedErr = err
 	}
-	if _, err := n.forwardTimeout(idx, opFlushShardName, encodeShardScopedFlush(idx), flushBroadcastGroupTimeout); err != nil {
+	if _, err := n.forwardTimeoutNoReplay(idx, opFlushShardName, encodeShardScopedFlush(idx), flushBroadcastGroupTimeout); err != nil {
 		if hostedErr != nil {
 			return fmt.Errorf("%v; leader hop: %v", hostedErr, err)
 		}
