@@ -277,6 +277,9 @@ func (n *Node) registerAdminOps() {
 		// ONE group named in its payload and never re-broadcasts. See
 		// wasm_broadcast.go.
 		opRegisterWASMShardName: n.handleRegisterWASMShard,
+		// Shard-scoped leg of the KV flush broadcast: proposes a flush to the ONE
+		// group named in its payload and never re-broadcasts. See flush_broadcast.go.
+		opFlushShardName: n.handleFlushShard,
 		// WASM blob transport: how a node that lacks a module's bytes obtains
 		// them. Both are node-local leaves — the put verifies, compiles and
 		// stores; the get reads the content-addressed store and NOTHING ELSE (no

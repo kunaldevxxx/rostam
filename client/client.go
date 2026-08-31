@@ -277,6 +277,19 @@ func (c *Client) Exists(ctx context.Context, key []byte) (bool, error) {
 	return wire.DecodeCASResult(res)
 }
 
+// Flush wipes the ENTIRE KV keyspace. A single call fans out SERVER-SIDE: flush is
+// keyless, so it falls to a round-robin server in pickInitialTarget, and the
+// receiving node's Call intercept broadcasts it into every shard group's Raft log
+// (see cluster.broadcastFlush). flush IS a nonReplayableOp: it is idempotent only
+// while nothing else writes between attempts, so a blind replay after an AMBIGUOUS
+// (post-transmission) transport failure could re-wipe data another client wrote in
+// the interval. On an ambiguous failure Call therefore surfaces the error instead
+// of silently re-flushing; the caller decides whether re-issuing is safe.
+func (c *Client) Flush(ctx context.Context) error {
+	_, err := c.Call(ctx, "flush", nil)
+	return err
+}
+
 // GetDel atomically returns key's value and deletes it. found is false (and value
 // nil) when the key was absent; a found empty value comes back as a non-nil
 // zero-length slice.
@@ -513,9 +526,17 @@ func (e *ambiguousError) Unwrap() error { return e.err }
 // original, and persist/caex report the wrong bit or extend a lease the caller
 // can no longer be sure it still holds. Read-only / idempotent ops (get, exists,
 // ttl, mget) are deliberately absent: replaying them cannot corrupt a result.
+//
+// "flush" and its INTERNAL per-group wrapper "__flush_shard__" (cluster's
+// opFlushShardName, forwarded between nodes over a peer Client) are both here: a
+// flush is idempotent ONLY while nothing writes between attempts, so replaying one
+// whose commit succeeded but whose response was lost would silently re-wipe writes
+// made in the interval. The wrapper must carry the same guard as "flush" or the
+// double-apply hole reopens one layer down — cluster.proposeFlush relies on this to
+// surface an ambiguous per-group flush instead of the peer Client re-sending it.
 func nonReplayableOp(op string) bool {
 	switch op {
-	case "set_nx", "cas", "cad", "getdel", "getset", "incr_ex", "caex", "persist":
+	case "set_nx", "cas", "cad", "getdel", "getset", "incr_ex", "caex", "persist", "flush", "__flush_shard__":
 		return true
 	}
 	return false
@@ -528,6 +549,15 @@ func isAmbiguous(err error) bool {
 	var a *ambiguousError
 	return errors.As(err, &a)
 }
+
+// IsAmbiguous reports whether err (returned by Client.Call) is a post-transmission
+// transport failure: the request may have committed on the server before the failure,
+// so its outcome is UNKNOWN. Exposed for callers that forward a non-replayable op
+// across peers and must not try another target after an ambiguous send — notably
+// cluster.proposeFlush, whose per-group flush leg must surface such an error rather
+// than re-issue the wipe against the next owner. A PRE-transmission failure (dial
+// refused, no leader yet) is not ambiguous and is safe to retry elsewhere.
+func IsAmbiguous(err error) bool { return isAmbiguous(err) }
 
 // isTransportError reports whether err is a network-level transport
 // error (dial refused, connection reset, EOF, etc.) that is safe to

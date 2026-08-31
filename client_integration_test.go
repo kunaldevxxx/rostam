@@ -84,6 +84,49 @@ func TestClientPutGet(t *testing.T) {
 	}
 }
 
+// TestClientFlushWipesStore exercises the typed client's Flush end-to-end against a
+// loopback server: it seeds keys, calls Flush once (which sends the keyless "flush"
+// op the server dispatches to handleFlush → cache.Flush), then asserts every key
+// misses and a post-flush write still reads back.
+func TestClientFlushWipesStore(t *testing.T) {
+	addr, stop := startTestStack(t)
+	defer stop()
+	c, err := client.New(client.Config{Servers: []string{addr}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+
+	ctx := context.Background()
+	for _, k := range []string{"a", "b", "c"} {
+		if _, err := c.Call(ctx, "put", wire.EncodePutArgs([]byte(k), []byte("v"), 0)); err != nil {
+			t.Fatalf("put %q: %v", k, err)
+		}
+	}
+
+	if err := c.Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	for _, k := range []string{"a", "b", "c"} {
+		_, err := c.Call(ctx, "get", wire.EncodeKeyArgs([]byte(k)))
+		if !errors.Is(err, client.ErrNotFound) {
+			t.Fatalf("get %q after flush: err = %v, want ErrNotFound", k, err)
+		}
+	}
+
+	if _, err := c.Call(ctx, "put", wire.EncodePutArgs([]byte("d"), []byte("w"), 0)); err != nil {
+		t.Fatalf("put after flush: %v", err)
+	}
+	res, err := c.Call(ctx, "get", wire.EncodeKeyArgs([]byte("d")))
+	if err != nil {
+		t.Fatalf("get after post-flush put: %v", err)
+	}
+	if !bytes.Equal(res, []byte("w")) {
+		t.Fatalf("post-flush get = %q, want w", res)
+	}
+}
+
 // Named to avoid colliding with the root Store-API test of the same intent
 // (client_test.go's TestClientGetMissingReturnsErrNotFound); this one exercises
 // the typed client's Call path directly.

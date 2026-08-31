@@ -53,6 +53,21 @@ var BuiltinOps = []BuiltinOp{
 	// the read counterpart of put_batch. The client groups keys by owning shard
 	// before it calls, so every key in one mget hashes to the same shard.
 	{"mget", OpReadOnly, mgetKeyExtractor, RouteLayoutNone, false},
+	// flush wipes the ENTIRE KV keyspace. It is KEYLESS (nil KeyExtractor,
+	// RouteLayoutNone), takes no args, and returns an empty ack. A keyless op would
+	// otherwise route to shard 0 alone, so the cluster path (cluster.Node.Call)
+	// intercepts flush and fans it out to EVERY shard group's Raft log — see
+	// cluster.broadcastFlush; Direct/embedded dispatches it once against its single
+	// cache.Cache.
+	//
+	// AUTHZ: registered OpReadWrite, so authz classifies it ActionWrite against the
+	// EMPTY (cluster) resource — exactly like del. It therefore requires GLOBAL write
+	// authority (write:*/*:*): a read-only key is rejected by ActionWrite, and a
+	// collection-scoped write:docs never matches the empty resource. That is the
+	// intended bar — write authority already implies deleting any key, and flush is
+	// merely the O(1) form of "delete every key" — so it is deliberately NOT added to
+	// the admin allowlist.
+	{"flush", OpReadWrite, nil, RouteLayoutNone, false},
 	// __ping__/__ready__/__metrics__/__repl_metrics__/__collections__ are shardless (nil KeyExtractor).
 	{"__ping__", OpReadOnly, nil, RouteLayoutNone, false},
 	{ReadyOp, OpReadOnly, nil, RouteLayoutNone, false},

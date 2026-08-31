@@ -149,6 +149,9 @@ func Handler(disp Dispatcher, opts Options) http.Handler {
 	mux.HandleFunc("GET /v1/kv/{key}", a.kvGet)
 	mux.HandleFunc("PUT /v1/kv/{key}", a.kvPut)
 	mux.HandleFunc("DELETE /v1/kv/{key}", a.kvDelete)
+	// Wipe the whole KV keyspace. A fixed, keyless route — no {key} — so it never
+	// collides with the /v1/kv/{key} patterns above (those are GET/PUT/DELETE only).
+	mux.HandleFunc("POST /v1/kv/flush", a.kvFlush)
 	mux.HandleFunc("POST /v1/collections", a.createCollection)
 	mux.HandleFunc("DELETE /v1/collections/{name}", a.dropCollection)
 	mux.HandleFunc("POST /v1/collections/{name}/points", a.putPoint)

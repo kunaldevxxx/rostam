@@ -217,6 +217,16 @@ var adminOps = map[string]struct{}{
 	// it, and peers are exempt by the internal-token grant.
 	"__wasm_blob_put__": {},
 	"__wasm_blob_get__": {},
+	// The INTERNAL shard-scoped leg of the KV flush broadcast
+	// (cluster/flush_broadcast.go). It drives a flush into ONE group and is
+	// reachable only over the internal-token peer path in normal operation, but is
+	// enumerated here — rather than relying on absence from the ops registry — for
+	// the reason spelled out above __register_wasm_shard__: absence is a
+	// coincidence a future refactor can remove, not a classification. `flush` ITSELF
+	// is a global-WRITE op (registered OpReadWrite, empty resource); the wrapper
+	// pins the shard-scoped leg at admin so it can never be silently demoted to
+	// write and handed to any write:* key.
+	"__flush_shard__": {},
 }
 
 // readOps is the small set of cluster-introspection ops that are explicitly

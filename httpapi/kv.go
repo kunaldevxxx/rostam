@@ -182,3 +182,16 @@ func (a *api) kvDelete(w http.ResponseWriter, r *http.Request) {
 	deleted := len(body) > 0 && body[0] == 1
 	writeJSON(w, http.StatusOK, map[string]bool{"deleted": deleted})
 }
+
+// kvFlush wipes the ENTIRE KV keyspace → {"flushed":true}. Dispatched via callWrite
+// with the default (no write-consistency) path and empty args; the flush op is
+// keyless and takes no body, and in cluster mode the node fans it out to every shard
+// group (cluster.broadcastFlush). It requires GLOBAL write authority (a read-only
+// key gets 401), exactly like kvDelete's classification but against the empty
+// (cluster) resource — see the flush routing row in sdk/wire.
+func (a *api) kvFlush(w http.ResponseWriter, r *http.Request) {
+	if _, ok := a.callWrite(w, r, "flush", nil, 0, true); !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"flushed": true})
+}

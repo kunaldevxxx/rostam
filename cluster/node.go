@@ -1143,6 +1143,12 @@ func (n *Node) Call(name string, args []byte) ([]byte, error) {
 		}
 		return []byte(report), nil
 	}
+	// A flush is the other op that must land in EVERY shard group's log, not just
+	// shard 0's: it is keyless (so shardIndexFor returns 0 for it) but wipes the
+	// WHOLE keyspace, and each group owns an independent cache. See broadcastFlush.
+	if name == flushOpName {
+		return n.broadcastFlush()
+	}
 	idx, err := n.shardIndexFor(ke, layout, args)
 	if err != nil {
 		return nil, err
@@ -1508,6 +1514,32 @@ func (n *Node) forward(shardIdx int, name string, args []byte) ([]byte, error) {
 // the whole owner-rotation loop, which is what makes it a bound on the CALL
 // rather than on one attempt.
 func (n *Node) forwardTimeout(shardIdx int, name string, args []byte, timeout time.Duration) ([]byte, error) {
+	return n.forwardTimeoutOpt(shardIdx, name, args, timeout, false)
+}
+
+// forwardTimeoutNoReplay is forwardTimeout for a NON-REPLAYABLE op. It differs in
+// exactly one respect: when a per-owner cl.Call returns an AMBIGUOUS error (a
+// post-transmission failure — the entry may already be committed, client.IsAmbiguous),
+// it returns that error IMMEDIATELY instead of trying the next owner. Trying another
+// owner after an ambiguous send is precisely a blind replay: it could apply the op a
+// SECOND time. A PRE-transmission error (dial refused, NotLeader, no-leader-yet) is
+// still safe to retry against the next owner, so those keep rotating.
+//
+// This exists for the flush per-group leg (cluster.proposeFlush): re-forwarding a
+// committed-but-ambiguous __flush_shard__ to another owner would append a second
+// flush and wipe any writes made in between — the double-apply the client-side
+// nonReplayableOp guard already closes for the external "flush" op. The plain
+// forwardTimeout is deliberately left untouched so WASM registration (which IS
+// idempotent under replay) keeps its rotate-on-any-error behavior.
+func (n *Node) forwardTimeoutNoReplay(shardIdx int, name string, args []byte, timeout time.Duration) ([]byte, error) {
+	return n.forwardTimeoutOpt(shardIdx, name, args, timeout, true)
+}
+
+// forwardTimeoutOpt is the shared owner-rotation loop behind forwardTimeout and
+// forwardTimeoutNoReplay. When noReplayOnAmbiguous is set, an ambiguous per-owner
+// error short-circuits the loop (see forwardTimeoutNoReplay); otherwise every error
+// rotates to the next owner (forwardTimeout's historical behavior).
+func (n *Node) forwardTimeoutOpt(shardIdx int, name string, args []byte, timeout time.Duration, noReplayOnAmbiguous bool) ([]byte, error) {
 	owners := n.ownersFor(shardIdx)
 	if len(owners) == 0 {
 		return nil, ErrNoShardOwner
@@ -1535,6 +1567,13 @@ func (n *Node) forwardTimeout(shardIdx int, name string, args []byte, timeout ti
 		res, err := cl.Call(ctx, name, args)
 		if err == nil {
 			return res, nil
+		}
+		// For a non-replayable op, an AMBIGUOUS (post-transmission) failure must NOT
+		// fall through to the next owner: the entry may already be committed, so a
+		// retry elsewhere would double-apply. Surface it now. Pre-transmission errors
+		// are not ambiguous and stay safe to retry, so they keep rotating below.
+		if noReplayOnAmbiguous && client.IsAmbiguous(err) {
+			return nil, err
 		}
 		lastErr = err // try the next owner (transport error / no leader yet)
 	}

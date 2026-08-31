@@ -5,6 +5,23 @@ Notable user-visible changes. Entries that alter existing behaviour are marked
 
 ## Unreleased
 
+- **New key-value op: `flush`.** Wipes the entire KV keyspace in one call,
+  in O(shards) rather than O(keys) — it swaps each shard's in-memory index for
+  an empty one and records a small per-shard durability watermark, so pages are
+  reclaimed lazily by later compaction instead of scanned and deleted up front.
+  It replicates like any other write (applied through each shard group's log, so
+  every replica converges on an empty keyspace) and, in a cluster, one call fans
+  out to every shard group. Requires a global write scope (`write:*`); a
+  read-only or single-collection key cannot flush. Available on the Go client as
+  `Flush(ctx)` and over REST as `POST /v1/kv/flush`. This removes the need for
+  the generation-counter workaround a cache driver otherwise needs for
+  `Cache::flush()`-style clears (which is not correct on the client side, because
+  the counter is itself an evictable cache entry). Caveat: flush empties the
+  keyspace but leaves the page allocation intact, so under the non-default
+  `PolicyRejectWrites` a shard that was full can still reject the next write with
+  "at capacity" until its space is reclaimed by a later cold compaction (at
+  restart) — under the default ring-buffer eviction policy this is invisible.
+
 - **Embedded web dashboard.** The server now ships a browser UI at
   `/dashboard/` for inspecting and operating on a running instance — vector
   collections, cluster topology, and KV keys — with no separate install. It

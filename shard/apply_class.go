@@ -341,5 +341,17 @@ func classifyApplyErr(err error) applyClass {
 	if errors.Is(err, cache.ErrFull) || errors.Is(err, cache.ErrCannotEvict) {
 		return classFatal
 	}
+	// cache.ErrFlushNotDurable: this replica could not make the flush watermark
+	// (flushed.seq sidecar) durable — a LOCAL disk fault that a peer need not share.
+	// It is fatal for the same reason ErrFull is: advancing the applied index past a
+	// flush this node could not durably record would, on a later failover, resurrect
+	// every pre-flush key while peers whose sidecar landed hold an empty keyspace —
+	// silent, permanent divergence. Fail-closed instead (halt in Raft mode; NACK in
+	// PB mode). On a single-node (non-replicated) shard classFatal does not halt (see
+	// fsm.go), which is correct: there is no peer to diverge from, and shard.flush
+	// writes the sidecar BEFORE the index swap, so the keyspace stays intact anyway.
+	if errors.Is(err, cache.ErrFlushNotDurable) {
+		return classFatal
+	}
 	return classAdvance
 }
