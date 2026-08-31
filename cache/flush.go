@@ -200,17 +200,20 @@ func (s *shard) writeFlushSidecar(floor uint64) error {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("cache: publish flush sidecar %s: %w", path, rerr)
 	}
-	// Make the rename itself durable. Best-effort, exactly like cold compaction's
-	// step 5: the bytes and the rename's target are already synced, so losing the
-	// directory entry across a crash only reverts THIS shard's watermark to its
-	// previous value or absence. On a single node that costs just the flush (retry
-	// it). On a REPLICATED shard, a replica that loses its sidecar this way can
-	// resurrect keys its peers wiped and nothing re-sends the already-applied flush,
-	// so the operator's remedy is to re-issue the (idempotent) flush; the fsync loss
-	// itself is rare and the temp-file bytes are already on disk.
+	// Make the rename itself durable. The bytes and the rename's TARGET inode are
+	// already fsynced; syncDir makes the rename's DIRECTORY ENTRY durable. If it
+	// fails we cannot know whether the rename survives a crash, so we must NOT
+	// acknowledge the flush as durable — return the error rather than warn-and-
+	// succeed. Because shard.flush writes this sidecar BEFORE it swaps the index, a
+	// failure here returns with the keyspace still live and the flush op fails, so
+	// the client retries. The residual is one-directional and NEVER resurrection: if
+	// the rename happened to survive, a crash before a successful retry applies the
+	// (already-durable) flush on restart — the "more flushed" direction — while the
+	// running node still held the keys and the errored flush told the caller the
+	// outcome was uncertain; a lost rename simply leaves nothing flushed, which the
+	// retry redoes.
 	if derr := syncDir(s.dataDir); derr != nil {
-		slog.Warn("cache: flush sidecar directory fsync failed; the watermark may not survive a crash",
-			"component", "cache", "dir", s.dataDir, "err", derr)
+		return fmt.Errorf("cache: fsync flush sidecar dir %s: %w", s.dataDir, derr)
 	}
 	return nil
 }

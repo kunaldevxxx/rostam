@@ -280,8 +280,11 @@ func (c *Client) Exists(ctx context.Context, key []byte) (bool, error) {
 // Flush wipes the ENTIRE KV keyspace. A single call fans out SERVER-SIDE: flush is
 // keyless, so it falls to a round-robin server in pickInitialTarget, and the
 // receiving node's Call intercept broadcasts it into every shard group's Raft log
-// (see cluster.broadcastFlush). It is idempotent, so it is deliberately NOT a
-// nonReplayableOp — a retry after an ambiguous transport failure simply re-wipes.
+// (see cluster.broadcastFlush). flush IS a nonReplayableOp: it is idempotent only
+// while nothing else writes between attempts, so a blind replay after an AMBIGUOUS
+// (post-transmission) transport failure could re-wipe data another client wrote in
+// the interval. On an ambiguous failure Call therefore surfaces the error instead
+// of silently re-flushing; the caller decides whether re-issuing is safe.
 func (c *Client) Flush(ctx context.Context) error {
 	_, err := c.Call(ctx, "flush", nil)
 	return err
@@ -525,7 +528,7 @@ func (e *ambiguousError) Unwrap() error { return e.err }
 // ttl, mget) are deliberately absent: replaying them cannot corrupt a result.
 func nonReplayableOp(op string) bool {
 	switch op {
-	case "set_nx", "cas", "cad", "getdel", "getset", "incr_ex", "caex", "persist":
+	case "set_nx", "cas", "cad", "getdel", "getset", "incr_ex", "caex", "persist", "flush":
 		return true
 	}
 	return false

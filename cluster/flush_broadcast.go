@@ -79,15 +79,19 @@ const flushBroadcastGroupTimeout = 10 * time.Second
 // converge on an empty keyspace without a coordinated clock (see cache.Cache.Flush's
 // durability-ordering contract).
 //
-// IDEMPOTENT. A flush is idempotent — re-applying it to an already-empty (or
-// since-rewritten) group simply re-wipes — so a Raft replay or a retry after a
-// partial failure is safe and needs no dedup.
+// REPLAY / RETRY. A single flush entry is idempotent WITHIN its own group — a Raft
+// replay re-wipes to the same empty state and needs no dedup. Retrying the whole
+// broadcast after a partial failure is how the groups that missed the first attempt
+// are eventually wiped, but it is NOT a no-op on the groups that already succeeded:
+// a write that landed in one of them since the first attempt is re-wiped by the
+// retry. That is inherent to "wipe everything now" — not a bug — and is why the
+// client op is nonReplayableOp, so Client.Call never blindly replays an ambiguous
+// flush; a caller re-issues only when re-wiping intervening writes is acceptable.
 //
 // PARTIAL FAILURE. Every group is attempted even after one fails (a transient
-// election on group 3 must not deny groups 4..N the flush), and a non-empty failure
-// set is returned as an error so the caller can retry. Retrying re-flushes the
-// groups that already succeeded to no ill effect, and is how a group that missed the
-// first attempt is eventually wiped.
+// election on group 3 must not deny groups 4..N the flush); a non-empty failure set
+// leaves the keyspace PARTIALLY wiped and is returned as an error so the caller can
+// decide whether to complete it.
 func (n *Node) broadcastFlush() ([]byte, error) {
 	var failures []string
 	for i := 0; i < n.cfg.NumShards; i++ {
@@ -96,7 +100,7 @@ func (n *Node) broadcastFlush() ([]byte, error) {
 		}
 	}
 	if len(failures) > 0 {
-		return nil, fmt.Errorf("cluster: flush: %d of %d shard groups failed (safe to retry, flush is idempotent): %s",
+		return nil, fmt.Errorf("cluster: flush: %d of %d shard groups failed — keyspace is now PARTIALLY wiped; re-issuing completes it but also re-wipes any writes made since to the groups that already succeeded: %s",
 			len(failures), n.cfg.NumShards, strings.Join(failures, "; "))
 	}
 	return nil, nil
