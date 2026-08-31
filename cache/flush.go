@@ -1,0 +1,241 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package cache
+
+import (
+	"encoding/binary"
+	"fmt"
+	"hash/crc32"
+	"log/slog"
+	"os"
+	"path/filepath"
+)
+
+// Flush wipes the ENTIRE KV keyspace of this cache in O(shards) — not O(keys) —
+// by swapping every shard's index table for a fresh empty one and recording a
+// per-shard durability watermark. After it returns, every Get/GetInto/Iterate on
+// a pre-flush key misses; post-flush writes proceed normally. Returns the first
+// shard error, if any.
+//
+// DURABILITY ORDERING CONTRACT (the reason the sidecar, not the index swap, is the
+// durable proof). The index swap is in-memory only; the crash-safe record of the
+// flush is each mmap shard's sidecar (dataDir/flushed.seq). shard.flush writes and
+// fsyncs that sidecar BEFORE it performs the swap (and thus before this method
+// returns), so a sidecar-write FAILURE aborts the flush with the keyspace intact —
+// never an ACKed-but-non-durable wipe (see shard.flush for why an errored handler
+// still advances the applied index, which makes that ordering load-bearing). On the
+// success path a replicated Flush OP applies through shard/fsm.go's Apply: the
+// handler runs to completion (syncing every sidecar) and only THEN does the deferred
+// f.cache.SetAppliedIndex(l.Index, …) persist the applied index (shard/fsm.go:287),
+// so the sidecar is always durable before the applied index can advance past the
+// flush op. That ordering is what prevents a crash from resurrecting flushed keys:
+// were the applied index persisted first, a crash could leave the log unable to
+// replay the flush (index already past it) while the pages still framed the wiped
+// entries — and the next rebuild would re-index them. Because the sidecar lands
+// first, the rebuild always sees the watermark and skips them.
+func (c *Cache) Flush() error {
+	var firstErr error
+	for _, s := range c.shards {
+		if err := s.flush(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// flush wipes one shard's keyspace under the full write lock (like a resize).
+//
+// The mechanism is a single atomic index swap — the same O(1) idiom resize
+// (shard.go) and cold compaction (compact.go) use — so lock-free readers pick up
+// the empty table on their next tab.Load(); a reader still holding a pre-swap table
+// snapshot may resolve a pre-flush key until it reloads, which is the ordinary
+// lock-free read contract, not a flush-specific hazard.
+//
+// FIELDS RESET, AND WHY ONLY THESE. The only in-memory "live" accounting a shard
+// keeps is the indexTable's live/tomb slot counts, and the swap to newIndexTable(0)
+// replaces the whole table — so those reset for free with the swap and there is
+// nothing else to zero. Deliberately NOT reset:
+//   - writeSeq — a monotonic high-water; resetting it would hand out sequences the
+//     rebuild's max-seq contest could collide with. We CAPTURE it as the floor and
+//     leave it advancing.
+//   - the cumulative stat counters (gets/misses/puts/dels/expirations/evictions/
+//     rejects/pagesAlloc/compactions/…) — Stats reports them as lifetime totals, not
+//     live gauges; zeroing them would corrupt those semantics.
+//   - the page bytes and their persisted head/tail offsets — bytesUsed derives the
+//     live-byte figure from (tail-head), but the pages OWN that allocation and a
+//     lock-free reject-writes reader may still alias those bytes, so we must not
+//     overwrite or reuse them online. The physical bytes are reclaimed lazily by
+//     cold compaction at the next open (which drops every now-unindexed entry), the
+//     same recovery path an mmap shard already relies on. So a running shard's
+//     BytesUsed stays non-zero after flush; its LIVE keyset is nonetheless empty
+//     (every Get misses, Iterate yields nothing).
+func (s *shard) flush() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Capture the floor: the current per-shard high-water sequence. Every entry now
+	// on the pages carries seq <= floor, so recording floor is exactly "wipe
+	// everything written so far". writeSeq itself is left untouched (monotonic).
+	floor := s.writeSeq
+
+	// Make the wipe DURABLE BEFORE it takes effect. An mmap shard rebuilds its index
+	// from page bytes at open, so the durable proof of a flush is the sidecar, not
+	// the in-memory swap. Writing (and fsyncing) the sidecar FIRST means a
+	// sidecar-write error returns here with the keyspace still intact and no swap
+	// performed — the flush op then fails and the client retries the idempotent
+	// flush — rather than ACKing an empty in-memory keyspace whose durable watermark
+	// never landed. That distinction matters because fsm.Apply advances the applied
+	// index even when the handler returns a (non-fatal) error, so a swap that
+	// preceded a failed sidecar write would leave the log unable to replay the flush
+	// on restart while the pages still framed the "wiped" entries: a resurrection on
+	// a single node, and a silent divergence from replicas whose sidecar write
+	// succeeded. Ordering the durable step first loses nothing on the success path —
+	// the swap below is infallible. And a crash BETWEEN this sidecar write and the
+	// swap is safe: the swap is RAM-only (lost on crash regardless) and, because the
+	// handler never returned, the applied index did not advance, so the log replays
+	// the flush — which the now-durable sidecar already makes the rebuild honor.
+	//
+	// Heap shards (!isMmap) have no rebuild path (their index is authoritative and
+	// never reconstructed from pages), so nothing a restart could resurrect and
+	// nothing to persist — skip the sidecar entirely.
+	if s.isMmap {
+		if err := s.writeFlushSidecar(floor); err != nil {
+			return err
+		}
+	}
+
+	// Durable now (or heap): perform the O(1) logical wipe. Swap in a fresh empty
+	// table — lock-free readers see it on their next load, and the old table (with
+	// its live/tomb counts) is dropped whole. The in-memory floor mirrors the
+	// sidecar for any same-process rebuild (none at runtime today; free and
+	// defensive).
+	s.flushedThroughSeq = floor
+	s.tab.Store(newIndexTable(0))
+	return nil
+}
+
+// Flush sidecar (dataDir/flushed.seq) — the per-shard durable watermark recording
+// the write-sequence floor a Cache.Flush() wiped through. Fixed 17-byte record,
+// CRC'd field-for-field the way cache/file.go guards its header fields.
+//
+//	0..3   magic uint32 (little-endian)
+//	4      version byte
+//	5..12  flushedThroughSeq uint64 (little-endian)
+//	13..16 CRC32-IEEE of bytes 0..12
+const (
+	flushSidecarName      = "flushed.seq"
+	flushSidecarTmpSuffix = ".tmp"
+	// flushSidecarMagic is "RSFL" in little-endian bytes — distinct from the pages
+	// file magic so a truncated/misnamed pages header can never be mistaken for a
+	// sidecar and vice versa.
+	flushSidecarMagic   uint32 = 0x4C465352
+	flushSidecarVersion byte   = 1
+	flushSidecarSize           = 17
+	flushSidecarCRCOff         = 13
+)
+
+// encodeFlushSidecar writes the fixed record into dst[:flushSidecarSize].
+func encodeFlushSidecar(dst []byte, floor uint64) {
+	binary.LittleEndian.PutUint32(dst[0:4], flushSidecarMagic)
+	dst[4] = flushSidecarVersion
+	binary.LittleEndian.PutUint64(dst[5:13], floor)
+	crc := crc32.ChecksumIEEE(dst[0:flushSidecarCRCOff])
+	binary.LittleEndian.PutUint32(dst[flushSidecarCRCOff:flushSidecarSize], crc)
+}
+
+// decodeFlushSidecar validates a sidecar record and returns its floor. ok=false on
+// any malformation — wrong length, bad magic/version, or CRC mismatch — so a torn
+// or foreign file collapses to "no watermark" (floor 0) rather than an over-report.
+func decodeFlushSidecar(b []byte) (floor uint64, ok bool) {
+	if len(b) != flushSidecarSize {
+		return 0, false
+	}
+	if binary.LittleEndian.Uint32(b[0:4]) != flushSidecarMagic {
+		return 0, false
+	}
+	if b[4] != flushSidecarVersion {
+		return 0, false
+	}
+	stored := binary.LittleEndian.Uint32(b[flushSidecarCRCOff:flushSidecarSize])
+	if stored != crc32.ChecksumIEEE(b[0:flushSidecarCRCOff]) {
+		return 0, false
+	}
+	return binary.LittleEndian.Uint64(b[5:13]), true
+}
+
+// writeFlushSidecar durably records `floor` into dataDir/flushed.seq using the same
+// atomic temp+fsync+rename+syncDir sequence cold compaction uses (compact.go): stage
+// into flushed.seq.tmp, fsync the temp so its bytes are on disk, rename over the real
+// path (atomic on POSIX), then fsync the directory so the rename survives a crash. A
+// crash-orphaned temp is harmless — it is never read and the next flush O_TRUNCs it.
+// Called with s.mu held.
+func (s *shard) writeFlushSidecar(floor uint64) error {
+	var rec [flushSidecarSize]byte
+	encodeFlushSidecar(rec[:], floor)
+
+	path := filepath.Join(s.dataDir, flushSidecarName)
+	tmp := path + flushSidecarTmpSuffix
+
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o640) //nolint:gosec // dataDir is caller-configured
+	if err != nil {
+		return fmt.Errorf("cache: create flush sidecar %s: %w", tmp, err)
+	}
+	if _, werr := f.Write(rec[:]); werr != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return fmt.Errorf("cache: write flush sidecar %s: %w", tmp, werr)
+	}
+	// fsync the bytes before anything points at them — this is the durability the
+	// flush's crash-safety rests on.
+	if serr := f.Sync(); serr != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return fmt.Errorf("cache: fsync flush sidecar %s: %w", tmp, serr)
+	}
+	if cerr := f.Close(); cerr != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("cache: close flush sidecar %s: %w", tmp, cerr)
+	}
+	if rerr := os.Rename(tmp, path); rerr != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("cache: publish flush sidecar %s: %w", path, rerr)
+	}
+	// Make the rename itself durable. Best-effort, exactly like cold compaction's
+	// step 5: the bytes and the rename's target are already synced, so losing the
+	// directory entry across a crash only reverts THIS shard's watermark to its
+	// previous value or absence. On a single node that costs just the flush (retry
+	// it). On a REPLICATED shard, a replica that loses its sidecar this way can
+	// resurrect keys its peers wiped and nothing re-sends the already-applied flush,
+	// so the operator's remedy is to re-issue the (idempotent) flush; the fsync loss
+	// itself is rare and the temp-file bytes are already on disk.
+	if derr := syncDir(s.dataDir); derr != nil {
+		slog.Warn("cache: flush sidecar directory fsync failed; the watermark may not survive a crash",
+			"component", "cache", "dir", s.dataDir, "err", derr)
+	}
+	return nil
+}
+
+// readFlushSidecar restores the flush watermark for a shard opening from dataDir.
+// A MISSING sidecar returns 0 — today's behaviour exactly, "nothing was ever
+// flushed". A present-but-invalid sidecar (torn write, CRC mismatch, foreign file)
+// ALSO returns 0 but is logged: the shard fails OPEN (pre-flush data may resurrect)
+// rather than refusing to start, mirroring readAppliedStamp/readPBFrontier, whose
+// 0-on-corruption is likewise the safe under-report.
+func readFlushSidecar(dataDir string) uint64 {
+	path := filepath.Join(dataDir, flushSidecarName)
+	b, err := os.ReadFile(path) //nolint:gosec // dataDir is caller-configured
+	if err != nil {
+		if !os.IsNotExist(err) {
+			slog.Warn("cache: cannot read flush sidecar; treating as no flush",
+				"component", "cache", "path", path, "err", err)
+		}
+		return 0
+	}
+	floor, ok := decodeFlushSidecar(b)
+	if !ok {
+		slog.Warn("cache: flush sidecar failed validation; treating as no flush (pre-flush data may resurrect)",
+			"component", "cache", "path", path)
+		return 0
+	}
+	return floor
+}

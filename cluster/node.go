@@ -1143,6 +1143,12 @@ func (n *Node) Call(name string, args []byte) ([]byte, error) {
 		}
 		return []byte(report), nil
 	}
+	// A flush is the other op that must land in EVERY shard group's log, not just
+	// shard 0's: it is keyless (so shardIndexFor returns 0 for it) but wipes the
+	// WHOLE keyspace, and each group owns an independent cache. See broadcastFlush.
+	if name == flushOpName {
+		return n.broadcastFlush()
+	}
 	idx, err := n.shardIndexFor(ke, layout, args)
 	if err != nil {
 		return nil, err

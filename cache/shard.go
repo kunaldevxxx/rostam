@@ -105,6 +105,21 @@ type shard struct {
 	region       []byte
 	appliedIndex atomic.Uint64
 
+	// dataDir is the shard's on-disk directory (the parent of pages.dat), or "" in
+	// heap mode. Set once in newShard, immutable thereafter, so flush can locate the
+	// durability sidecar (dataDir/flushed.seq) without re-deriving it from s.file.
+	dataDir string
+
+	// flushedThroughSeq is the write-sequence FLOOR a prior Cache.Flush() recorded in
+	// this shard's sidecar (dataDir/flushed.seq): every entry whose metaSeq(meta) <=
+	// this value was logically wiped by that flush and MUST NOT be re-indexed by the
+	// warm-restart rebuild, nor resurrected across a restart. Restored from the
+	// sidecar at open BEFORE rebuildIndexFromPages runs; 0 when no sidecar exists
+	// (byte-identical to pre-flush behaviour) or it fails its CRC. Written under mu on
+	// flush; otherwise touched only at construction (single-threaded, pre-publish),
+	// and never read off-lock at runtime, so a plain field suffices.
+	flushedThroughSeq uint64
+
 	// stats — atomic counters; no shard lock needed. `hits` is NOT stored: every
 	// read bumps `gets` on entry and bumps `misses` on any non-returning path
 	// (absent, collision, corrupt, expired-on-read), so Hits = Gets - Misses is
@@ -208,6 +223,7 @@ type shard struct {
 func newShard(cfg Config, dataDir string) (*shard, error) {
 	s := &shard{
 		cfg:         cfg,
+		dataDir:     dataDir,
 		stopSweeper: make(chan struct{}),
 	}
 	if cfg.NowFn != nil {
@@ -275,6 +291,13 @@ func newShard(cfg Config, dataDir string) (*shard, error) {
 
 	s.attachMmapRegion(file, region)
 	s.appliedIndex.Store(appliedIdx)
+	// Restore the flush watermark BEFORE the index rebuild, so rebuildIndexFromPages
+	// can skip every entry a prior Cache.Flush() logically wiped (seq <= floor). Read
+	// unconditionally: on a fresh pages file it is normally absent (→ 0), but a
+	// sidecar that outlived a rotated-aside pages file would otherwise let post-fresh
+	// low-seq writes be wrongly skipped on the next restart — the writeSeq floor-lift
+	// below closes that too.
+	s.flushedThroughSeq = readFlushSidecar(dataDir)
 	if !fresh {
 		// Restore the persisted LOGICAL clock (v3 header; 0 on a v2 file). This is
 		// what lets cold compaction judge TTL expiry deterministically on a
@@ -318,6 +341,19 @@ func newShard(cfg Config, dataDir string) (*shard, error) {
 	// order is free to disagree with page order (it always did — see
 	// firstPageWithRoomLocked). This is now purely about packing density.
 	s.writeIdx = writeIdx
+
+	// writeSeq-restore — the flush durability payoff, and a genuine hazard without it.
+	// rebuildIndexFromPages recovers writeSeq as max(seq) over the SURVIVING entries;
+	// when a prior Flush() emptied this shard there are no survivors and the recovered
+	// max is ~0, while the flush floor may be large. Lift writeSeq to the floor so the
+	// NEXT writes get seq > floor and can never be re-classified as flushed (seq <=
+	// floor) — and therefore skipped — by a FUTURE restart's rebuild. Skipping this
+	// step would silently lose every post-flush write on the second restart. It only
+	// ever raises writeSeq (max is monotonic), so it is a no-op on a shard that was
+	// never flushed.
+	if s.flushedThroughSeq > s.writeSeq {
+		s.writeSeq = s.flushedThroughSeq
+	}
 
 	s.startSweeper()
 	return s, nil
@@ -993,6 +1029,15 @@ func (s *shard) rebuildIndexFromPages() {
 			}
 			esize := entrySize(len(key), len(value))
 			seq := metaSeq(meta)
+			if seq <= s.flushedThroughSeq {
+				// Wiped by a prior Cache.Flush(): this entry is below the durable flush
+				// floor, so it is neither indexed NOR allowed to contribute to the
+				// recovered max(seq) — letting it lift writeSeq back into the flushed
+				// range would re-open the very hazard the writeSeq-restore in newShard
+				// closes. Skip it entirely.
+				cursor += esize
+				continue
+			}
 			if seq > maxSeq {
 				maxSeq = seq
 			}

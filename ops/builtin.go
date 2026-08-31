@@ -71,6 +71,10 @@ var builtinHandlers = map[string]Handler{
 	"incr_ex": handleIncrEx,
 	"caex":    handleCAEX,
 	"mget":    handleMGet,
+	// flush wipes the ENTIRE KV keyspace (keyless, no args). The cluster path
+	// broadcasts it to every shard group; each group applies it here against its own
+	// cache. See handleFlush.
+	"flush": handleFlush,
 	// put_batch packs N puts into one Raft log entry (one fsync / round-trip /
 	// apply for the whole batch). It routes by its FIRST key, so every key in a
 	// batch must hash to the same shard — the cluster fan-out (Node.PutBatch)
@@ -194,6 +198,7 @@ var builtinHandlers = map[string]Handler{
 //   - "incr_ex" (read-write) args: [keyLen u16][key][delta i64][ttlMs u64] → new value as i64 BE (TTL set on create only)
 //   - "caex"    (read-write) args: [keyLen u16][key][expLen u32][expected][ttlMs u64] → 1-byte 1=TTL refreshed/0=mismatch|absent
 //   - "mget"    (read-only)  args: [count u16]([keyLen u16][key])*         → [count u16]([found u8](+[valLen u32][val] if found))*
+//   - "flush"   (read-write) args: (ignored)                               → empty (wipes the ENTIRE keyspace; broadcast to every shard group in cluster mode)
 //   - "__ping__" (read-only) args: (ignored)                             → empty
 //
 // Routing metadata (kind/wire.KeyExtractor/wire.RouteLayout) comes from wire.BuiltinOps,
@@ -245,6 +250,18 @@ func handleDel(tx *TxContext, args []byte) ([]byte, error) {
 		return []byte{1}, nil
 	}
 	return []byte{0}, nil
+}
+
+// handleFlush wipes the ENTIRE KV keyspace of the cache this op is applied against
+// in O(shards), not O(keys) — see cache.Cache.Flush. It is keyless and ignores its
+// args (the client sends nil); it returns (nil, err), the empty ack del returns on
+// success. In the cluster it applies once per shard group (cluster.broadcastFlush
+// lands it in every group's log), so the union of every group's Flush wipes the
+// whole keyspace. Flush is idempotent, so a Raft replay or a broadcast retry is
+// safe. No apply-stamping: cache.Flush captures each replica's local writeSeq floor,
+// so replicas converge on an empty keyspace with no coordinated clock.
+func handleFlush(tx *TxContext, _ []byte) ([]byte, error) {
+	return nil, tx.Cache().Flush()
 }
 
 func handleExpire(tx *TxContext, args []byte) ([]byte, error) {

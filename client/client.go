@@ -277,6 +277,16 @@ func (c *Client) Exists(ctx context.Context, key []byte) (bool, error) {
 	return wire.DecodeCASResult(res)
 }
 
+// Flush wipes the ENTIRE KV keyspace. A single call fans out SERVER-SIDE: flush is
+// keyless, so it falls to a round-robin server in pickInitialTarget, and the
+// receiving node's Call intercept broadcasts it into every shard group's Raft log
+// (see cluster.broadcastFlush). It is idempotent, so it is deliberately NOT a
+// nonReplayableOp — a retry after an ambiguous transport failure simply re-wipes.
+func (c *Client) Flush(ctx context.Context) error {
+	_, err := c.Call(ctx, "flush", nil)
+	return err
+}
+
 // GetDel atomically returns key's value and deletes it. found is false (and value
 // nil) when the key was absent; a found empty value comes back as a non-nil
 // zero-length slice.
