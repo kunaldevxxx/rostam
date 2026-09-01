@@ -122,8 +122,8 @@ func (m *MetaRaft) ApplySetMembersIfLeader(peers []Peer, numShards, replicationF
 	// ReplicationFactor is stored in State since it is not derivable from
 	// Placement after an online rebalance (Placement diverges from the computed
 	// layout); comparing st.ReplicationFactor avoids reverting rebalanced shards.
-	// st.ReplicationFactor == 0 means an old snapshot predating this field: fall
-	// through and let Apply record it.
+	// !st.ReplicationFactorSet means a snapshot predating this field: fall
+	// through and let Apply record it without resetting Placement.
 	st := m.FSM.State()
 	if st.NumShards == numShards &&
 		st.MinISR == minISR &&

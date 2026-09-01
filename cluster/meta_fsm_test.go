@@ -116,6 +116,39 @@ func TestMetaFSMStateIsDeepCopy(t *testing.T) {
 	}
 }
 
+// TestApplySetMembersRFChangeIsNotIdempotent is the regression test for #71:
+// when only ReplicationFactor changes (same members, shard count, MinISR),
+// ApplySetMembersIfLeader must NOT short-circuit — Placement must be recomputed.
+func TestApplySetMembersRFChangeIsNotIdempotent(t *testing.T) {
+	f := NewMetaFSM()
+	peers := []Peer{
+		{NodeID: "n1", RaftAddr: "a:1", ServerAddr: "a:2"},
+		{NodeID: "n2", RaftAddr: "b:1", ServerAddr: "b:2"},
+		{NodeID: "n3", RaftAddr: "c:1", ServerAddr: "c:2"},
+	}
+	apply := func(rf int) {
+		data, _ := encodeLogEntry(LogEntry{Op: OpSetMembers, Members: peers, NumShards: 2, ReplicationFactor: rf})
+		if resp := f.Apply(&raft.Log{Data: data}); resp != nil {
+			t.Fatalf("Apply(RF=%d): %v", rf, resp)
+		}
+	}
+	// Bootstrap with RF=3 (full replication on 3 nodes).
+	apply(3)
+	st := f.State()
+	if len(st.Placement[0]) != 3 {
+		t.Fatalf("after RF=3: Placement[0] len = %d, want 3", len(st.Placement[0]))
+	}
+	// Change only RF to 2. Placement must reflect the new RF.
+	apply(2)
+	st = f.State()
+	if len(st.Placement[0]) != 2 {
+		t.Fatalf("after RF=2: Placement[0] len = %d, want 2 (RF change was dropped)", len(st.Placement[0]))
+	}
+	if st.ReplicationFactor != 2 || !st.ReplicationFactorSet {
+		t.Fatalf("ReplicationFactor not recorded: got %d set=%v", st.ReplicationFactor, st.ReplicationFactorSet)
+	}
+}
+
 func TestMetaFSMApplySortsMembersByNodeID(t *testing.T) {
 	f := NewMetaFSM()
 	// Pass members in reverse alphabetical order.
