@@ -116,6 +116,22 @@ func TestMetaFSMStateIsDeepCopy(t *testing.T) {
 	}
 }
 
+func TestMetaFSMStateShardFormerIsDeepCopy(t *testing.T) {
+	f := NewMetaFSM()
+	data, _ := encodeLogEntry(LogEntry{Op: OpSetShardFormer, ShardID: 0, Node: "n1"})
+	// OpSetShardFormer returns true on first write (write-once designation), not nil.
+	resp := f.Apply(&raft.Log{Data: data})
+	if installed, ok := resp.(bool); !ok || !installed {
+		t.Fatalf("Apply: expected true, got %v", resp)
+	}
+	st1 := f.State()
+	st1.ShardFormer[0] = "MUTATED"
+	st2 := f.State()
+	if st2.ShardFormer[0] != "n1" {
+		t.Errorf("ShardFormer not deep-copied: got %q, want %q", st2.ShardFormer[0], "n1")
+	}
+}
+
 func TestMetaFSMApplySortsMembersByNodeID(t *testing.T) {
 	f := NewMetaFSM()
 	// Pass members in reverse alphabetical order.
