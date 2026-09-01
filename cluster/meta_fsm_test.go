@@ -116,7 +116,6 @@ func TestMetaFSMStateIsDeepCopy(t *testing.T) {
 	}
 }
 
-
 func TestApplySetMembersRFChangeIsNotIdempotent(t *testing.T) {
 	f := NewMetaFSM()
 	peers := []Peer{

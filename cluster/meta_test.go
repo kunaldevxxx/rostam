@@ -104,7 +104,6 @@ func TestMetaRaftApplySetCatalogEntry(t *testing.T) {
 	}
 }
 
-
 func TestApplySetMembersIfLeaderRFChangeIsNotIdempotent(t *testing.T) {
 	mr, cfg := newTestMetaRaft(t)
 
