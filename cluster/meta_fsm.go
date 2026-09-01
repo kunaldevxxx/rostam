@@ -170,6 +170,12 @@ func (m *MetaFSM) State() State {
 			cp.ShardISR[k] = append([]string(nil), v...)
 		}
 	}
+	if m.state.ShardFormer != nil {
+		cp.ShardFormer = make(map[int]string, len(m.state.ShardFormer))
+		for k, v := range m.state.ShardFormer {
+			cp.ShardFormer[k] = v
+		}
+	}
 	return cp
 }
 
