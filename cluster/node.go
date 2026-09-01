@@ -125,11 +125,17 @@ type Node struct {
 	// pbSeedStop signals the background PB control-plane seeder goroutine to exit
 	// (closed in Close). nil in raft mode and on restart (Bootstrap=false).
 	pbSeedStop chan struct{}
+	// pbSeedWg tracks the seeder goroutine so Close() can wait for it to exit
+	// before tearing down meta-Raft (which the goroutine uses).
+	pbSeedWg sync.WaitGroup
 
 	// formationStop signals the shard-formation seeder and driver goroutines to
 	// exit (closed in Close). See cluster/shard_formation.go: these form the Raft
 	// groups whose owner set excludes the -bootstrap node, which nothing else does.
 	formationStop chan struct{}
+	// formationWg tracks the seeder and driver goroutines so Close() can wait for
+	// them to exit before closing shards and meta-Raft.
+	formationWg sync.WaitGroup
 
 	// metaFrontier coalesces concurrent follower __meta_readindex__ forwards on THIS
 	// node into one leader RTT, guaranteeing no read accepts a frontier captured
@@ -679,7 +685,12 @@ func newMultiNode(cfg Config) (*Node, error) {
 		if cfg.Bootstrap {
 			n.pbSeedStop = make(chan struct{})
 			seedStop := n.pbSeedStop
-			go n.seedPBControlPlane(meta, pbShardControlSeeds(n.placement), seedStop)
+			seeds := pbShardControlSeeds(n.placement)
+			n.pbSeedWg.Add(1)
+			go func() {
+				defer n.pbSeedWg.Done()
+				n.seedPBControlPlane(meta, seeds, seedStop)
+			}()
 			// Ensure a later construction error path also signals the seeder to exit.
 			prevCT := closeTransport
 			closeTransport = func() {
@@ -799,8 +810,16 @@ func newMultiNode(cfg Config) (*Node, error) {
 		// goroutine would race. Formation only cares about the INITIAL placement
 		// anyway — a shard added to a node later is created by AddShardOwner, which
 		// joins an already-formed group rather than forming one.
-		go n.seedShardFormers(meta, n.placementCopy(), n.formationStop)
-		go n.driveShardFormation(n.formationStop)
+		placement := n.placementCopy()
+		n.formationWg.Add(2)
+		go func() {
+			defer n.formationWg.Done()
+			n.seedShardFormers(meta, placement, n.formationStop)
+		}()
+		go func() {
+			defer n.formationWg.Done()
+			n.driveShardFormation(n.formationStop)
+		}()
 	}
 
 	// Primary-backup mode: start the lease-keeper now that every owned shard's
@@ -1841,11 +1860,13 @@ func (n *Node) Close() error {
 		// mode). closeOnce guarantees the channel is closed exactly once.
 		if n.pbSeedStop != nil {
 			close(n.pbSeedStop)
+			n.pbSeedWg.Wait()
 		}
 		// Stop shard formation before the shards close: the driver calls
 		// BootstrapGroup on them.
 		if n.formationStop != nil {
 			close(n.formationStop)
+			n.formationWg.Wait()
 		}
 		// End the blob fetch loops. They retry forever by design, so without this
 		// a node with an unfetchable module would keep dialling after Close.
