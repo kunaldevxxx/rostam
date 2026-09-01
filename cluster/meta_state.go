@@ -131,12 +131,8 @@ type State struct {
 	// rest of State. NEVER blocks the election reset (that is OpSetShardEpoch, which
 	// deliberately resets the ISR to {primary} — a different op, not floor-checked).
 	MinISR int
-	// ReplicationFactor is the RF committed by the last OpSetMembers entry. A zero
-	// value (old gob snapshot, or raft mode before this field existed) means "not
-	// yet recorded" — the idempotency guard in ApplySetMembersIfLeader treats 0 as
-	// unset and will not short-circuit on an RF mismatch, matching the pre-fix
-	// behavior. gob matches by field name so old snapshots decode it as 0 safely.
-	ReplicationFactor int
+	ReplicationFactor    int
+	ReplicationFactorSet bool
 	// LastIndex carries the MetaFSM command frontier (its applied-command index)
 	// INTO a snapshot so a snapshot-restored follower does not under-report 0 and
 	// wait forever for the readIndex barrier. It is FSM-applied metadata, NOT

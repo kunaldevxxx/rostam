@@ -127,7 +127,7 @@ func (m *MetaRaft) ApplySetMembersIfLeader(peers []Peer, numShards, replicationF
 	st := m.FSM.State()
 	if st.NumShards == numShards &&
 		st.MinISR == minISR &&
-		st.ReplicationFactor == replicationFactor &&
+		st.ReplicationFactorSet && st.ReplicationFactor == replicationFactor &&
 		peerSlicesEqual(st.Members, sortedPeers) {
 		return nil
 	}

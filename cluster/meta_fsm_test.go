@@ -534,6 +534,9 @@ func equalState(a, b State) bool {
 	if a.NumShards != b.NumShards || len(a.Members) != len(b.Members) || len(a.Placement) != len(b.Placement) {
 		return false
 	}
+	if a.ReplicationFactor != b.ReplicationFactor || a.ReplicationFactorSet != b.ReplicationFactorSet {
+		return false
+	}
 	for i := range a.Members {
 		if a.Members[i] != b.Members[i] {
 			return false

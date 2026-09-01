@@ -322,6 +322,7 @@ func (m *MetaFSM) Apply(log *raft.Log) any {
 		m.state.Members = sorted
 		m.state.NumShards = entry.NumShards
 		m.state.ReplicationFactor = entry.ReplicationFactor
+		m.state.ReplicationFactorSet = true
 		// Placement distributes shards across members in replica sets of
 		// ReplicationFactor nodes; rf 0 / >= len(members) = full replication.
 		m.state.Placement = computePlacement(sorted, entry.NumShards, entry.ReplicationFactor)
