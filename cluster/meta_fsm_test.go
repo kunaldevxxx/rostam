@@ -116,9 +116,7 @@ func TestMetaFSMStateIsDeepCopy(t *testing.T) {
 	}
 }
 
-// TestApplySetMembersRFChangeIsNotIdempotent is the regression test for #71:
-// when only ReplicationFactor changes (same members, shard count, MinISR),
-// ApplySetMembersIfLeader must NOT short-circuit — Placement must be recomputed.
+
 func TestApplySetMembersRFChangeIsNotIdempotent(t *testing.T) {
 	f := NewMetaFSM()
 	peers := []Peer{
