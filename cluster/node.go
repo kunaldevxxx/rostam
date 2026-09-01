@@ -685,10 +685,11 @@ func newMultiNode(cfg Config) (*Node, error) {
 		if cfg.Bootstrap {
 			n.pbSeedStop = make(chan struct{})
 			seedStop := n.pbSeedStop
+			seeds := pbShardControlSeeds(n.placement)
 			n.pbSeedWg.Add(1)
 			go func() {
 				defer n.pbSeedWg.Done()
-				n.seedPBControlPlane(meta, pbShardControlSeeds(n.placement), seedStop)
+				n.seedPBControlPlane(meta, seeds, seedStop)
 			}()
 			// Ensure a later construction error path also signals the seeder to exit.
 			prevCT := closeTransport
@@ -809,10 +810,11 @@ func newMultiNode(cfg Config) (*Node, error) {
 		// goroutine would race. Formation only cares about the INITIAL placement
 		// anyway — a shard added to a node later is created by AddShardOwner, which
 		// joins an already-formed group rather than forming one.
+		placement := n.placementCopy()
 		n.formationWg.Add(2)
 		go func() {
 			defer n.formationWg.Done()
-			n.seedShardFormers(meta, n.placementCopy(), n.formationStop)
+			n.seedShardFormers(meta, placement, n.formationStop)
 		}()
 		go func() {
 			defer n.formationWg.Done()
