@@ -41,6 +41,27 @@ func computePlacement(members []Peer, numShards, rf int) [][]string {
 	return out
 }
 
+// placementEqual reports whether two placement slices are identical (same shard
+// count, same owner sets in the same order). Used by the idempotency guard in
+// ApplySetMembersIfLeader to detect RF-only changes that alter Placement without
+// changing Members, NumShards, or MinISR.
+func placementEqual(a, b [][]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if len(a[i]) != len(b[i]) {
+			return false
+		}
+		for j := range a[i] {
+			if a[i][j] != b[i][j] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // placementContains reports whether nodeID is in the owner set.
 func placementContains(owners []string, nodeID string) bool {
 	for _, o := range owners {

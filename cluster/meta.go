@@ -119,8 +119,15 @@ func (m *MetaRaft) ApplySetMembersIfLeader(peers []Peer, numShards, replicationF
 	})
 	// Idempotency: skip if state already matches (INCLUDING the seeded ISR floor,
 	// so a first bootstrap that must raise MinISR from 0 is not skipped).
+	// ReplicationFactor is not stored in State directly; compare the computed
+	// target placement against the current one so an RF-only change is not
+	// silently dropped.
 	st := m.FSM.State()
-	if st.NumShards == numShards && st.MinISR == minISR && peerSlicesEqual(st.Members, sortedPeers) {
+	targetPlacement := computePlacement(sortedPeers, numShards, replicationFactor)
+	if st.NumShards == numShards &&
+		st.MinISR == minISR &&
+		peerSlicesEqual(st.Members, sortedPeers) &&
+		placementEqual(st.Placement, targetPlacement) {
 		return nil
 	}
 	entry, err := encodeLogEntry(LogEntry{
